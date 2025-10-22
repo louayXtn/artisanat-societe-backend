@@ -1,105 +1,141 @@
-const multer = require('multer');
-const path = require('path');
-const Product = require('../models/Product');
-const fs = require('fs');
 
-// إعداد التخزين في مجلد واحد فقط
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, path.join(__dirname, '../images'));
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
-  }
-});
+const multer = require('multer');
+const Product = require('../models/Product');
+const { cloudinary, storage } = require('../config/cloudinary');
 
 const upload = multer({ storage });
 
-// دالة إضافة المنتج
+// addProduct is an array: multer middleware then handler
+
 const addProduct = [
   upload.single('image'),
   async (req, res) => {
     try {
-      const { name, category, price, description } = req.body;
-      if (!req.file) return res.status(400).json({ message: 'الصورة مطلوبة' });
+      // console.dir(req.file, { depth: 2 });
+      if (!req.file) return res.status(400).json({ message: 'Image required' });
 
-      const imagePath = `/images/${req.file.filename}`;
+      const imageUrl = req.file.path || req.file.secure_url || req.file.url;
+      const imageId = req.file.filename || req.file.public_id;
 
       const newProduct = new Product({
-        name,
-        category,
-        price: parseFloat(price),
-        description,
-        image_path: imagePath
+        name: req.body.name,
+        category: req.body.category,
+        price: req.body.price ? parseFloat(req.body.price) : undefined,
+        description: req.body.description,
+        image_path: imageUrl,
+        imageId,
       });
 
       await newProduct.save();
-      res.status(201).json({ message: 'تمت إضافة المنتج بنجاح', product: newProduct });
-    } catch (error) {
-      res.status(500).json({ message: 'خطأ في إضافة المنتج', error });
+      return res.status(201).json({ product: newProduct });
+    } catch (err) {
+      // log full error for debugging
+      console.error('addProduct error:', err && err.stack ? err.stack : err);
+      // return JSON so client JSON.parse doesn't fail
+      return res.status(500).json({ message: 'Server error', error: err.message || err });
     }
   }
 ];
-// دالة حذف المنتج
+
+function getCloudinaryPublicId(idOrUrl) {
+  if (!idOrUrl) return null;
+  // already a public_id (may include folder)
+  if (!idOrUrl.startsWith('http')) return idOrUrl;
+  // it's a URL — extract the part after '/upload/' and remove version and extension
+  const parts = idOrUrl.split('/upload/');
+  if (parts.length < 2) return null;
+  let after = parts[1]; // e.g. "v12345/products/xxxxx.jpg"
+  // remove version prefix if present (v12345/)
+  if (after.startsWith('v') && after.includes('/')) {
+    after = after.substring(after.indexOf('/') + 1);
+  }
+  // remove query string and file extension
+  after = after.split('?')[0].replace(/\.[^/.]+$/, '');
+  return after;
+}
+
 const deleteProduct = async (req, res) => {
   try {
     const { id } = req.params;
-
     const product = await Product.findByIdAndDelete(id);
-    if (!product) {
-      return res.status(404).json({ message: 'المنتج غير موجود' });
+    if (!product) return res.status(404).json({ message: 'المنتج غير موجود' });
+
+    const storedId = product.imageId || product.image_path;
+    const publicId = getCloudinaryPublicId(storedId);
+
+    if (publicId) {
+      try {
+        // console.log('Deleting Cloudinary image public_id:', publicId);
+        const result = await cloudinary.uploader.destroy(publicId, {
+          resource_type: 'image',
+          invalidate: true,
+        });
+        // console.log('Cloudinary destroy result:', result);
+      } catch (e) {
+        console.warn('Cloudinary delete failed:', e && e.message ? e.message : e);
+      }
+    } else {
+      console.warn('No image public id found to delete for product', id);
     }
 
-    // حذف الصورة من مجلد images
-    const imagePath = path.join(__dirname, '../images', path.basename(product.image_path));
-    fs.unlink(imagePath, (err) => {
-      if (err) {
-        console.warn('تعذر حذف الصورة:', err.message);
-      }
-    });
-
-    res.status(200).json({ message: 'تم حذف المنتج والصورة بنجاح' });
+    return res.status(200).json({ message: 'تم حذف المنتج' });
   } catch (error) {
-    res.status(500).json({ message: 'حدث خطأ أثناء الحذف', error });
+    console.error('deleteProduct error:', error && error.stack ? error.stack : error);
+    return res.status(500).json({ message: 'حدث خطأ أثناء الحذف', error: error.message });
   }
 };
 
-// module.exports = { addProduct, deleteProduct };
-// دالة جلب كل المنتجات
+// ...existing code...
 const getAllProducts = async (req, res) => {
   try {
-    const products = await Product.find();
-    res.status(200).json(products);
-  } catch (error) {
-    res.status(500).json({ message: 'خطأ في جلب المنتجات', error });
+    const products = await Product.find().lean(); // lean() returns plain objects
+    // optional: ensure image_path exists for every product
+    const mapped = products.map(p => ({
+      ...p,
+      image_path: p.image_path || null
+    }));
+    return res.status(200).json(mapped);
+  } catch (err) {
+    console.error('getAllProducts error:', err);
+    return res.status(500).json({ message: 'Server error', error: err.message || String(err) });
   }
 };
 
-// دالة البحث حسب الاسم
+const mongoose = require('mongoose');
+
+
 const searchProductsByName = async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ message: 'كلمة البحث مطلوبة' });
 
   try {
-    const regex = new RegExp(q, 'i'); // بحث غير حساس لحالة الحروف
+    const safeQ = String(q).slice(0, 100); // limit length
+    const regex = new RegExp(safeQ.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); // escape regex chars
     const products = await Product.find({ name: regex })
-      .select('name price image_path') // فقط الحقول المطلوبة
-      .limit(10); // تحديد عدد النتائج
-
-    res.status(200).json(products);
+      .select('name price image_path')
+      .limit(10)
+      .lean();
+    return res.status(200).json(products);
   } catch (error) {
-    res.status(500).json({ message: 'خطأ أثناء البحث', error });
+    console.error('searchProductsByName error:', error);
+    return res.status(500).json({ message: 'خطأ أثناء البحث', error: error.message });
   }
 };
+
 const getProductById = async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({ message: 'Invalid product id' });
+  }
   try {
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findById(id).lean();
     if (!product) return res.status(404).json({ message: 'المنتج غير موجود' });
-
-    res.status(200).json(product);
+    return res.status(200).json(product);
   } catch (error) {
-    res.status(500).json({ message: 'خطأ في جلب المنتج', error });
+    console.error('getProductById error:', error);
+    return res.status(500).json({ message: 'خطأ في جلب المنتج', error: error.message });
   }
 };
 
-module.exports = { addProduct, deleteProduct, getAllProducts , searchProductsByName, getProductById};
+
+module.exports = { addProduct, deleteProduct, getAllProducts, searchProductsByName, getProductById };
