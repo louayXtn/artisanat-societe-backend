@@ -81,7 +81,7 @@ app.use((err, req, res, next) => {
   console.error('Unhandled error:', err && err.stack ? err.stack : err);
   res.status(err?.status || 500).json({ message: 'Server error', error: err?.message || String(err) });
 });
-app.use('/ping', (req, res) => res.status(200).send('pong'));
+app.use('/ping', (req, res) => res.status(200).send('Waken!!!'));
 mongoose.connection.once("open", () => {
   console.log("Connected to MongoDB");
   app.listen(PORT, () => {
